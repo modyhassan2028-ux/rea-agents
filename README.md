@@ -413,3 +413,14 @@ demos remain subject to vendor terms, including user, feature, automation, and
 output sharing restrictions. Cracked copies, stolen keys, unauthorized key
 sharing, and bypassing license restrictions are not authorized. This guidance
 does not amend MIT or third-party licenses.
+
+---
+
+## Fork Note (complete buildable source)
+
+This is a complete, vendored copy of [morluto/rea](https://github.com/morluto/rea) (MIT License, © 2026 morluto), prepared for easy local editing:
+
+- **Full git history preserved** from upstream.
+- **All `third_party` submodules vendored inline** (binwalk, unblob, wakaru, ghidra-nativeaot, jadx-headless-mcp) so the tree is self-contained — no `git submodule update` needed.
+- **Build verified**: `npm install` → `npm run build` and `npm run typecheck` both pass cleanly on Node 24.
+- To build: `npm install && npm run build` (requires Node ≥ 22.19).
