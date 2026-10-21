@@ -1,0 +1,428 @@
+use crate::collections::HashMap;
+
+use swc_core::common::{sync::Lrc, Mark, SourceMap, GLOBALS};
+use swc_core::ecma::ast::ModuleItem;
+use swc_core::ecma::transforms::base::resolver;
+use swc_core::ecma::visit::VisitMutWith;
+
+use super::io::{parse_js_with_recovery, parse_script_with_recovery, ParseDiagnostic};
+use super::types::{UnpackWarning, UnpackWarningKind};
+
+pub(super) fn collect_tdz_warnings(
+    module: &swc_core::ecma::ast::Module,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    crate::tdz_check::check_tdz(module)
+        .into_iter()
+        .map(|v| {
+            UnpackWarning::new(
+                filename,
+                UnpackWarningKind::TdzViolation,
+                format!("reference to `{}` before declaration", v.name),
+            )
+        })
+        .collect()
+}
+
+/// Report export names that an ES module output still accesses through
+/// `exports`. This reads the final pipeline AST instead of re-parsing the
+/// emitted code, so it also runs without `--diagnostics`. Only the free
+/// `exports` and `module` globals matter, and rules leave those with the
+/// resolver's `unresolved_mark`.
+pub(super) fn collect_commonjs_export_residual_warnings(
+    module: &swc_core::ecma::ast::Module,
+    unresolved_mark: Mark,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    let names =
+        crate::commonjs_export_residual::unrecovered_commonjs_export_names(module, unresolved_mark);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let list = names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![UnpackWarning::new(
+        filename,
+        UnpackWarningKind::CommonJsExportUnrecovered,
+        format!(
+            "ES module output still accesses CommonJS exports {list}; these accesses throw a ReferenceError when they run"
+        ),
+    )]
+}
+
+/// Report a webpack lazy load that kept its loader, through `require.e` or
+/// `require.t`, which the split output does not define.
+pub(super) fn collect_webpack_runtime_residual_warnings(
+    module: &swc_core::ecma::ast::Module,
+    unresolved_mark: Mark,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    let Some(member) =
+        crate::rules::webpack_lazy_import::kept_lazy_load_runtime_member(module, unresolved_mark)
+    else {
+        return Vec::new();
+    };
+    vec![UnpackWarning::new(
+        filename,
+        UnpackWarningKind::RuntimeResidual,
+        format!(
+            "webpack runtime member `require.{member}` is kept, which the split output does not define; the lazy load throws when it runs"
+        ),
+    )]
+}
+
+/// Report the `require` calls an ES module output still makes. ESM has no
+/// `require`, so `UnEsm` keeps such a module CommonJS; one that reaches the
+/// output anyway is a require a later stage was expected to convert. Webpack
+/// loader calls whose module id no input links, numeric or string, are not
+/// reported: unpack reports them as `runtime_residual`.
+pub(super) fn collect_commonjs_require_residual_warnings(
+    module: &swc_core::ecma::ast::Module,
+    unresolved_mark: Mark,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    let calls = crate::kept_require::esm_output_require_calls(module, unresolved_mark);
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let mut sources: Vec<String> = Vec::new();
+    for call in &calls {
+        let source = call
+            .source
+            .as_ref()
+            .map_or_else(|| "<dynamic>".to_string(), |source| format!("\"{source}\""));
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+    vec![UnpackWarning::new(
+        filename,
+        UnpackWarningKind::CommonJsRequireUnrecovered,
+        format!(
+            "ES module output still calls `require` for {}; these calls throw a ReferenceError when they run",
+            sources.join(", ")
+        ),
+    )]
+}
+
+/// Report the kept requires of a CommonJS output module whose provider is
+/// now an ES module that `require` gives a different value, as
+/// `run_kept_require_default_reads` returned them. A later pass can still
+/// turn the module into ESM or a require into an import, so only the sources
+/// the final module still requires are reported.
+pub(super) fn collect_commonjs_require_of_esm_warnings(
+    unhandled: Vec<(swc_core::atoms::Atom, &'static str)>,
+    module: &swc_core::ecma::ast::Module,
+    unresolved_mark: Mark,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    if unhandled.is_empty()
+        || module
+            .body
+            .iter()
+            .any(|item| matches!(item, ModuleItem::ModuleDecl(_)))
+    {
+        return Vec::new();
+    }
+    let kept = crate::kept_require::kept_require_calls(module, unresolved_mark);
+    unhandled
+        .into_iter()
+        .filter(|(source, _)| kept.iter().any(|call| call.source.as_ref() == Some(source)))
+        .map(|(source, reason)| {
+            UnpackWarning::new(
+                filename,
+                UnpackWarningKind::CommonJsRequireOfEsm,
+                format!(
+                    "CommonJS module requires \"{source}\", now an ES module, and `require` returns its namespace: {reason}"
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Report each provider whose CommonJS `exports` object this module passes
+/// to a callee the unpack plan cannot follow (one in another module that is
+/// not an interop helper that module is proven to export, or an unknown one),
+/// when the provider became an ES module read through its namespace. The
+/// namespace takes no write, so a write there throws when it runs; a write
+/// the plan can see keeps the provider CommonJS instead.
+pub(super) fn collect_commonjs_exports_escape_warnings(
+    facts: &crate::facts::ModuleFactsMap,
+    plan: &crate::interface_plan::InterfacePlan,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    use crate::provider_interface::{ProviderInterface, RequiredValueImport};
+
+    let Some(own) = facts.get(filename) else {
+        return Vec::new();
+    };
+    let mut reported: Vec<&str> = Vec::new();
+    let mut warnings = Vec::new();
+    for edge in own.require_edges.iter() {
+        let Some(uses) = edge.uses.as_ref() else {
+            continue;
+        };
+        // An interop helper bundled as its own module only reads the value,
+        // when barrier 0 proved that export is one.
+        let other_callee = uses.passed_to_other_module.iter().find(|callee| {
+            plan.helper_kind(filename, &callee.source, &callee.export)
+                .is_none()
+        });
+        if other_callee.is_none() && !uses.passed_to_unknown {
+            continue;
+        }
+        if reported.contains(&edge.source.as_ref()) {
+            continue;
+        }
+        let Some(key) = facts.resolve_key_from(Some(filename), &edge.source) else {
+            continue;
+        };
+        let Some(provider) = facts.get(&key) else {
+            continue;
+        };
+        let interface = ProviderInterface::of(provider);
+        if provider.stays_commonjs
+            || !plan.exports_object_writable(&key)
+            || interface.required_value_import() != Some(RequiredValueImport::Namespace)
+        {
+            continue;
+        }
+        reported.push(edge.source.as_ref());
+        let callee = match other_callee {
+            Some(other) => format!("a function from \"{}\"", other.source),
+            None => "a function wakaru cannot follow".to_string(),
+        };
+        warnings.push(UnpackWarning::new(
+            filename,
+            UnpackWarningKind::CommonJsExportsEscape,
+            format!(
+                "passes the CommonJS exports of \"{}\" to {callee}, but that module is now an ES module whose namespace cannot be written; a write there throws when it runs",
+                edge.source
+            ),
+        ));
+    }
+    warnings
+}
+
+/// With `--diagnostics`: report a module that stayed CommonJS although its
+/// input showed ES-source `evidence` (see
+/// [`crate::kept_require::es_source_evidence`]) and it keeps a require that
+/// runs on every evaluation of its body.
+pub(super) fn collect_es_source_kept_commonjs_warnings(
+    module: &swc_core::ecma::ast::Module,
+    unresolved_mark: Mark,
+    evidence: &[&str],
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    crate::kept_require::es_source_kept_commonjs_message(module, unresolved_mark, evidence)
+        .map(|message| {
+            UnpackWarning::new(filename, UnpackWarningKind::EsSourceKeptCommonJs, message)
+        })
+        .into_iter()
+        .collect()
+}
+
+pub(super) fn collect_input_parse_warnings(errors: &[ParseDiagnostic]) -> Vec<UnpackWarning> {
+    // Source locations identify occurrences, not distinct parser conditions.
+    // Keep the first-seen signature order while collapsing repeated conditions
+    // within one parsed file.
+    let mut group_indexes: HashMap<(&str, &str), usize> = HashMap::default();
+    let mut groups: Vec<(&ParseDiagnostic, usize)> = Vec::new();
+
+    for error in errors {
+        let signature = (error.filename.as_str(), error.message.as_str());
+        if let Some(index) = group_indexes.get(&signature).copied() {
+            groups[index].1 += 1;
+        } else {
+            group_indexes.insert(signature, groups.len());
+            groups.push((error, 1));
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|(first, occurrences)| {
+            let message = if occurrences == 1 {
+                format!("input parse recovered from parser error: {first}")
+            } else {
+                format!(
+                    "input parse recovered from repeated parser error {} ({occurrences} occurrences; first at {}:{}:{})",
+                    first.message, first.filename, first.line, first.column
+                )
+            };
+            UnpackWarning::new(
+                &first.filename,
+                UnpackWarningKind::InputParseRecovered,
+                message,
+            )
+        })
+        .collect()
+}
+
+pub(super) fn collect_duplicate_declaration_warnings(
+    module: &swc_core::ecma::ast::Module,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    crate::output_validate::conflicting_lexical_declaration_names(module)
+        .into_iter()
+        .map(|name| {
+            UnpackWarning::new(
+                filename,
+                UnpackWarningKind::DuplicateDeclaration,
+                format!("duplicate lexical declaration `{name}`"),
+            )
+        })
+        .collect()
+}
+
+/// Validate the text users receive, then resolve that emitted program from
+/// scratch before running identity-sensitive diagnostics. Transform rules can
+/// legally change lexical scope without rebuilding every pre-transform
+/// `SyntaxContext`; those internal contexts must not become user warnings.
+pub(super) fn collect_output_diagnostics(code: &str, filename: &str) -> Vec<UnpackWarning> {
+    GLOBALS.set(&Default::default(), || {
+        let cm: Lrc<SourceMap> = Default::default();
+        match parse_js_with_recovery(code, filename, cm) {
+            Ok(parsed) if parsed.recoverable_errors.is_empty() => {
+                collect_resolved_output_warnings(parsed.module, filename)
+            }
+            Ok(parsed)
+                if parsed
+                    .module
+                    .body
+                    .iter()
+                    .any(|item| matches!(item, ModuleItem::ModuleDecl(_))) =>
+            {
+                output_parse_warnings(parsed.recoverable_errors, filename)
+            }
+            Ok(parsed) => match parse_script_with_recovery(code, filename, Default::default()) {
+                Ok(script) if script.recoverable_errors.is_empty() => {
+                    collect_resolved_output_warnings(script.module, filename)
+                }
+                Ok(script) => output_parse_warnings(script.recoverable_errors, filename),
+                Err(_) => output_parse_warnings(parsed.recoverable_errors, filename),
+            },
+            Err(module_error) => {
+                match parse_script_with_recovery(code, filename, Default::default()) {
+                    Ok(script) if script.recoverable_errors.is_empty() => {
+                        collect_resolved_output_warnings(script.module, filename)
+                    }
+                    Ok(script) => output_parse_warnings(script.recoverable_errors, filename),
+                    Err(_) => vec![UnpackWarning::new(
+                        filename,
+                        UnpackWarningKind::OutputParseFailed,
+                        format!("emitted output failed to parse: {module_error}"),
+                    )],
+                }
+            }
+        }
+    })
+}
+
+fn collect_resolved_output_warnings(
+    mut module: swc_core::ecma::ast::Module,
+    filename: &str,
+) -> Vec<UnpackWarning> {
+    let unresolved_mark = Mark::new();
+    let top_level_mark = Mark::new();
+    module.visit_mut_with(&mut resolver(unresolved_mark, top_level_mark, false));
+
+    let mut warnings = collect_tdz_warnings(&module, filename);
+    warnings.extend(collect_duplicate_declaration_warnings(&module, filename));
+    warnings
+}
+
+fn output_parse_warnings(errors: Vec<ParseDiagnostic>, filename: &str) -> Vec<UnpackWarning> {
+    errors
+        .into_iter()
+        .map(|error| {
+            UnpackWarning::new(
+                filename,
+                UnpackWarningKind::OutputParseRecovered,
+                format!("emitted output parse recovered from parser error: {error}"),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emitted_var_lexical_conflicts_are_errors_in_either_order() {
+        for source in [
+            "export const value = 1; export var value = 2;",
+            "export var value = 1; export const value = 2;",
+            "let value; if (ok) { var value; }",
+            "{ const value = 1; if (ok) { var value; } }",
+            "function f() { const value = 1; var value; }",
+            "var f = () => { const value = 1; var value; };",
+            "for (let value of values) { var value; }",
+            "switch (tag) { case 0: const value = 1; break; case 1: var value; }",
+            "const { value } = source; var value;",
+            "var value; class value {}",
+        ] {
+            let warnings = collect_output_diagnostics(source, "entry.js");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning.kind == UnpackWarningKind::DuplicateDeclaration),
+                "missed conflict: {source}\n{warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legal_var_redeclarations_and_nested_shadowing_are_not_errors() {
+        for source in [
+            "var value; var value;",
+            "var value; if (ok) { var value; }",
+            "var value; { const value = 1; }",
+            "const value = 1; function f() { var value; }",
+            "function f(value) { var value; }",
+            "function f(value, value) {}",
+            "function value() {} function value() {}",
+            "var value; function value() {}",
+            "const value = class value {};",
+        ] {
+            let warnings = collect_output_diagnostics(source, "entry.js");
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|warning| warning.kind == UnpackWarningKind::DuplicateDeclaration),
+                "false conflict: {source}\n{warnings:?}"
+            );
+        }
+    }
+
+    fn parse_diagnostic(line: usize, message: &str) -> ParseDiagnostic {
+        ParseDiagnostic {
+            filename: "classic-script.js".to_string(),
+            line,
+            column: 1,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn input_parse_warning_coalescing_preserves_signature_order() {
+        let warnings = collect_input_parse_warnings(&[
+            parse_diagnostic(2, "WithInStrict"),
+            parse_diagnostic(3, "TS1102"),
+            parse_diagnostic(5, "WithInStrict"),
+            parse_diagnostic(8, "TS1102"),
+        ]);
+
+        assert_eq!(warnings.len(), 2, "warnings should coalesce: {warnings:#?}");
+        assert!(warnings[0].message.contains("WithInStrict"));
+        assert!(warnings[0].message.contains("2 occurrences"));
+        assert!(warnings[0].message.contains("classic-script.js:2:1"));
+        assert!(warnings[1].message.contains("TS1102"));
+        assert!(warnings[1].message.contains("2 occurrences"));
+        assert!(warnings[1].message.contains("classic-script.js:3:1"));
+    }
+}
